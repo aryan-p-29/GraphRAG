@@ -153,21 +153,25 @@ class GeminiNativeLLM(CustomLLM):
 # Cypher context retriever — pulls call-stack + imports for matched nodes
 # ─────────────────────────────────────────────────────────────────────────────
 
-# FIX: explicit 2-hop traversal over ALL tracked edge types.
-# Variable-length paths [:1..2] are fine for CALLS/IMPORTS chains;
-# DEFINES and HAS_METHOD are kept at depth-1 to avoid noise.
+# ── Contextual node query ────────────────────────────────────────────────────
+# 
+# Returns three sets of facts about a seed node:
+#   outgoing_d1 : direct edges (any type) at depth 1
+#   call_paths  : variable-length CALLS chains 1..3 hops returned as
+#                 ordered node-name lists so the serialiser can write
+#                 "A CALLS B CALLS C" execution paths
+#   incoming    : who CALLS / DEFINES / INHERITS this node
 CONTEXT_CYPHER = """\
 MATCH (n {id: $node_id})
 
-// ── Depth-1 outgoing: all edge types ──────────────────────────────────
-OPTIONAL MATCH (n)-[r_out:CALLS|IMPORTS|DEFINES|HAS_METHOD|INHERITS|IMPLEMENTS]->(d1)
+// ── Direct edges (depth 1, all relationship types) ───────────────────
+OPTIONAL MATCH (n)-[r_out:CALLS|IMPORTS|DEFINES|HAS_METHOD|INHERITS]->(d1)
 
-// ── Depth-2 outgoing: CALLS and IMPORTS only (call-stack / import chain)
-OPTIONAL MATCH (d1)-[r_out2:CALLS|IMPORTS]->(d2)
-  WHERE d1 IS NOT NULL
+// ── Deep CALLS traversal: up to 3 hops ─────────────────────────────
+OPTIONAL MATCH path = (n)-[:CALLS*1..3]->(leaf)
 
-// ── Depth-1 incoming: who calls / defines / inherits this node ─────────
-OPTIONAL MATCH (c1)-[r_in:CALLS|DEFINES|INHERITS|IMPLEMENTS]->(n)
+// ── Incoming callers / definers ─────────────────────────────────
+OPTIONAL MATCH (c1)-[r_in:CALLS|DEFINES|INHERITS]->(n)
 
 RETURN
     n.id            AS node_id,
@@ -175,23 +179,15 @@ RETURN
     labels(n)[0]    AS node_label,
     n.docstring     AS docstring,
     n.signature     AS signature,
-    // depth-1 outgoing
+    // direct depth-1 edges
     collect(DISTINCT {
-        hop:   1,
         rel:   type(r_out),
         name:  d1.name,
         id:    d1.id,
         label: labels(d1)[0]
     }) AS outgoing_d1,
-    // depth-2 outgoing
-    collect(DISTINCT {
-        hop:   2,
-        rel:   type(r_out2),
-        via:   d1.name,
-        name:  d2.name,
-        id:    d2.id,
-        label: labels(d2)[0]
-    }) AS outgoing_d2,
+    // deep CALLS paths — each entry is the list of node names along the path
+    collect(DISTINCT [node IN nodes(path) | node.name]) AS call_paths,
     // incoming callers / definers
     collect(DISTINCT {
         rel:   type(r_in),
@@ -236,9 +232,13 @@ class CypherContextRetriever(BaseRetriever):
     # ── Internal helper ───────────────────────────────────────────────────────
     def _cypher_context(self, node_id: str) -> str:
         """
-        Run 2-hop Cypher and serialize the result as clean English sentences.
-        Format is designed for LLM consumption, not human readability.
-        Each fact is a separate declarative sentence on its own line.
+        Run the CONTEXT_CYPHER query and serialize results into clean English
+        sentences optimised for LLM consumption.
+
+        Multi-hop CALLS paths are rendered as linear execution chains:
+            "Function 'A' CALLS Function 'B' CALLS Function 'C'."
+        Direct facts use simple declarative form:
+            "Function 'init' CALLS Function 'wrap_stream'."
         """
         import os as _os
         driver = self._store._driver
@@ -260,29 +260,36 @@ class CypherContextRetriever(BaseRetriever):
         if row.get("docstring"):
             lines.append(f"{label} '{name}' documentation: {row['docstring']}.")
 
-        # ── Depth-1 outgoing ──────────────────────────────────────────────────
+        # ── Depth-1 outgoing (all edge types) ──────────────────────────────
         for o in (row.get("outgoing_d1") or []):
             if not o.get("name"):
                 continue
-            rel   = o["rel"]
+            rel  = o["rel"]
             tname = o["name"]
             tlbl  = o.get("label") or "Node"
             lines.append(f"{label} '{name}' {rel} {tlbl} '{tname}'.")
 
-        # ── Depth-2 outgoing (transitives) ────────────────────────────────────
-        for o in (row.get("outgoing_d2") or []):
-            if not o.get("name"):
+        # ── Deep CALLS execution paths (1–3 hops) ─────────────────────────
+        # Each call_path is a list of node names along the CALLS chain:
+        #   ['init', 'wrap_stream', 'emit']  →
+        #   "Function 'init' CALLS 'wrap_stream' CALLS 'emit'."
+        seen_paths: set[tuple] = set()
+        for path_names in (row.get("call_paths") or []):
+            if not path_names or len(path_names) < 2:
                 continue
-            rel   = o["rel"]
-            tname = o["name"]
-            via   = o.get("via") or "?"
-            tlbl  = o.get("label") or "Node"
-            lines.append(
-                f"{label} '{name}' transitively {rel} {tlbl} '{tname}'"
-                f" (via '{via}')."
-            )
+            # Filter out None entries and deduplicate paths
+            clean = [n for n in path_names if n]
+            if len(clean) < 2:
+                continue
+            key = tuple(clean)
+            if key in seen_paths:
+                continue
+            seen_paths.add(key)
+            # Format: "Label 'A' CALLS 'B' CALLS 'C'."
+            path_str = f" CALLS ".join(f"'{n}'" for n in clean[1:])
+            lines.append(f"{label} '{clean[0]}' CALLS {path_str}.")
 
-        # ── Incoming ──────────────────────────────────────────────────────────
+        # ── Incoming callers / definers ──────────────────────────────────
         for i in (row.get("incoming") or []):
             if not i.get("name"):
                 continue
@@ -293,7 +300,7 @@ class CypherContextRetriever(BaseRetriever):
 
         text = "\n".join(lines)
 
-        # ── Debug: print context block when DEBUG_CONTEXT=1 ───────────────────
+        # ── Debug: print context block when DEBUG_CONTEXT=1 ─────────────────
         if _os.environ.get("DEBUG_CONTEXT"):
             import sys
             print(f"\n{'='*60}", file=sys.stderr)
@@ -371,11 +378,24 @@ class HybridRetriever(BaseRetriever):
         super().__init__()
 
     def _retrieve(self, query_bundle: QueryBundle) -> list[NodeWithScore]:
-        # Stage 1: vector similarity
+        """
+        Two-stage hybrid retrieval with multi-target keyword expansion.
+
+        Stage 1 — Vector similarity: embed query → top-k nearest nodes.
+        Stage 2 — Keyword Cypher: extract EVERY function/method name mentioned
+                   in the query (e.g. both 'login' and 'verify' from
+                   "How does login() pass data to verify()?") and run an
+                   independent Cypher expansion for each, aggregating results
+                   without duplicates.
+        Stage 3 — Seed Cypher: expand the vector seed IDs through the graph.
+        """
+        import re as _re
+
+        # ── Stage 1: vector similarity ─────────────────────────────────────
         vector_results: list[NodeWithScore] = self._vector.retrieve(query_bundle)
         logger.info("Vector retriever returned %d node(s)", len(vector_results))
 
-        # Extract seed IDs — probe multiple metadata keys for compatibility
+        # Extract seed IDs — probe multiple metadata keys
         seed_ids: list[str] = []
         seen: set[str] = set()
         for nws in vector_results:
@@ -392,31 +412,40 @@ class HybridRetriever(BaseRetriever):
 
         logger.info("Extracted %d seed ID(s) from vector results", len(seed_ids))
 
-        # Stage 2: keyword-targeted Cypher search — BYPASSES top_k truncation.
-        # This guarantees that named entities mentioned in the query (e.g. init())
-        # always get a context block even if they weren't in the top-k vector hits.
-        import re as _re
+        # ── Stage 2: multi-target keyword Cypher expansion ──────────────────
+        # Extract ALL code-pattern names from the query, not just the first one.
+        # e.g. "How does login() pass data to verify()?" → ['login', 'verify']
         q = query_bundle.query_str
-        code_pats = _re.findall(r'\b([A-Za-z_]\w*)\s*\(\)', q)
-        quoted    = _re.findall(r'[`]([^`]+)[`]', q)
-        keyword   = (code_pats[0] if code_pats
-                     else quoted[0].strip() if quoted
-                     else max(q.split(), key=len, default=q))
-        keyword   = keyword.rstrip("().:,")
-        # Expand keyword seeds directly — result is already NodeWithScore objects
-        keyword_results: list[NodeWithScore] = self._cypher.retrieve_from_ids(
-            [], query_str=keyword
-        )
-        for nws in keyword_results:
-            seen.add(nws.node.id_)
-        logger.info("Keyword Cypher expansion returned %d block(s) for %r", len(keyword_results), keyword)
+        code_pats = [k.rstrip("().:,") for k in _re.findall(r'\b([A-Za-z_]\w*)\s*\(\)', q)]
+        quoted    = [k.strip().rstrip("().:,") for k in _re.findall(r'[`]([^`]+)[`]', q)]
 
-        # Stage 3: Cypher 2-hop expansion of top-k vector seed IDs
-        # (keyword IDs already expanded above — skip duplicates)
+        # Deduplicated ordered list of keywords to expand
+        keywords: list[str] = []
+        kw_seen:  set[str]  = set()
+        for kw in (code_pats or quoted or [max(q.split(), key=len, default=q)]):
+            if kw and kw not in kw_seen:
+                keywords.append(kw)
+                kw_seen.add(kw)
+
+        # Run a Cypher expansion for EACH keyword and aggregate, skip duplicates
+        keyword_results: list[NodeWithScore] = []
+        for kw in keywords:
+            kw_blocks = self._cypher.retrieve_from_ids([], query_str=kw)
+            for nws in kw_blocks:
+                if nws.node.id_ not in seen:
+                    seen.add(nws.node.id_)
+                    keyword_results.append(nws)
+        logger.info(
+            "Keyword Cypher expansion: %d keyword(s) → %d unique block(s) %s",
+            len(keywords), len(keyword_results), keywords,
+        )
+
+        # ── Stage 3: seed Cypher expansion (vector neighbours) ──────────────
         vector_cypher = self._cypher.retrieve_from_ids(seed_ids)
         logger.info("Vector Cypher expansion returned %d context block(s)", len(vector_cypher))
 
-        # Keyword context first (highest priority, name-matched), then vector context, then raw vectors
+        # Keyword results first (name-matched, highest priority),
+        # then graph-expanded vector context, then raw vector nodes.
         return keyword_results + vector_cypher + vector_results
 
 

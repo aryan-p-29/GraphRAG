@@ -20,7 +20,7 @@ NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "graphrag123")
 # ── Gemini ────────────────────────────────────────────────────────────────────
 GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY", "")
 EMBEDDING_MODEL  = os.getenv("EMBEDDING_MODEL", "models/gemini-embedding-001")
-LLM_MODEL        = os.getenv("LLM_MODEL", "models/gemini-3-flash-preview")
+LLM_MODEL        = os.getenv("LLM_MODEL", "models/gemini-3.1-flash-lite")
 
 # ── Language Registry ─────────────────────────────────────────────────────────
 # Maps file extensions → parser module + class name (loaded lazily in dispatcher)

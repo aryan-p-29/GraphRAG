@@ -24,7 +24,7 @@ MAX_RETRIES        = 6         # total attempts before giving up
 INITIAL_BACKOFF    = 2.0       # seconds before first retry
 BACKOFF_MULTIPLIER = 2.0       # multiplied each retry
 MAX_BACKOFF        = 64.0      # cap on wait time
-EMBED_DIM          = 768       # Gemini text-embedding-004 output dimension (PATCHED)
+EMBED_DIM          = 768       # Gemini text-embedding-004 output dimension
 
 # ── Client ────────────────────────────────────────────────────────────────────
 _client: Optional[genai.Client] = None

@@ -129,31 +129,55 @@ def global_fuzzy_resolve(nodes: list[NodeData], edges: list[EdgeData]) -> None:
     """
     Cross-file fuzzy resolution of unmatched CALLS targets.
 
-    Operates across the ENTIRE parsed repository so that attribute calls like
-    `forecaster.forecast()` can be resolved to a method node defined in any
-    other file — something the per-file parser cannot do.
+    The parser now emits full dotted targets such as "crud.create_user" or
+    "self._helper". We use the prefix to narrow candidates before applying
+    the ambiguity cutoff, preventing both false-positive and false-negative edges.
 
-    Strategy:
-      1. Build a map: callee_name → [candidate_id, ...]  (Methods first, then Functions).
-      2. For every dangling CALLS edge (target ID absent from the node set),
-         look up the callee name extracted from the last '::' segment:
-           - 1 candidate   → reroute confidently.
-           - 2–3 candidates → emit an edge to each.
-           - 4+ candidates  → too ambiguous; skip.
+    Resolution algorithm (per dangling CALLS edge):
+    ──────────────────────────────────────────────
+    1. Parse the raw callee from the last '::' segment:
+         "file.py::crud.create_user" → prefix="crud",  method="create_user"
+         "file.py::self._helper"     → prefix="self",  method="_helper"
+         "file.py::get_engine"       → prefix=None,    method="get_engine"
+
+    2. Gather all candidates for `method` (Methods first, then Functions).
+
+    3. Apply prefix filter:
+         prefix == "self"  → keep only candidates in the SAME source file
+                             as the caller.
+         prefix == other   → keep candidates whose file_path or parent_name
+                             contains the prefix string (case-insensitive).
+         prefix == None    → no filter.
+
+    4. If filtered candidates ≤ 3  → reroute.
+       If filtered candidates > 3  → still ambiguous; drop.
+       If 0 after filter           → fall back to unfiltered list, same rule.
     """
     node_ids: set[str] = {n.id for n in nodes}
 
     method_map: dict[str, list[str]] = defaultdict(list)
     func_map:   dict[str, list[str]] = defaultdict(list)
+    class_map:  dict[str, list[str]] = defaultdict(list)
+    init_map:   dict[str, str]       = {}  # class_id -> init_method_id
+
+    # id → properties dict (avoids constructing invalid NodeData sentinels)
+    props_by_id: dict[str, dict] = {n.id: n.properties for n in nodes}
+
     for n in nodes:
         name = n.properties.get("name", "")
         if n.label == "Method":
             method_map[name].append(n.id)
+            if name == "__init__":
+                # The parent class ID can be derived since method IDs are "class_id::method_name"
+                parent_class_id = n.id.rsplit("::", 1)[0]
+                init_map[parent_class_id] = n.id
         elif n.label == "Function":
             func_map[name].append(n.id)
+        elif n.label == "Class":
+            class_map[name].append(n.id)
 
-    new_edges: list[EdgeData] = []
-    remove_idx: set[int] = set()
+    new_edges:  list[EdgeData] = []
+    remove_idx: set[int]       = set()
 
     for idx, edge in enumerate(edges):
         if edge.type != "CALLS":
@@ -161,24 +185,58 @@ def global_fuzzy_resolve(nodes: list[NodeData], edges: list[EdgeData]) -> None:
         if edge.target_id in node_ids:
             continue  # already resolved
 
-        callee_name = edge.target_id.split("::")[-1]
-        candidates  = method_map.get(callee_name) or func_map.get(callee_name) or []
+        # Parse dotted callee from the last '::' segment
+        raw_callee = edge.target_id.split("::")[-1]   # e.g. "crud.create_user"
+        parts = raw_callee.split(".", 1)
+        if len(parts) == 2:
+            prefix, method_name = parts[0], parts[1]
+        else:
+            prefix, method_name = None, parts[0]
 
-        if not candidates or len(candidates) > 3:
-            continue  # unresolvable or too ambiguous
+        # Gather all candidates
+        all_candidates = method_map.get(method_name) or func_map.get(method_name) or class_map.get(method_name) or []
+        if not all_candidates:
+            continue
+
+        # Apply prefix-based narrowing
+        if prefix and prefix.lower() == "self":
+            caller_file = edge.source_id.split("::")[0]
+            filtered = [
+                c for c in all_candidates
+                if props_by_id.get(c, {}).get("file_path", "") == caller_file
+            ]
+        elif prefix:
+            p_lower = prefix.lower()
+            filtered = [
+                c for c in all_candidates
+                if (p_lower in props_by_id.get(c, {}).get("file_path", "").lower()
+                    or p_lower in props_by_id.get(c, {}).get("parent_name", "").lower())
+            ]
+        else:
+            filtered = all_candidates
+
+        # Fall back to unfiltered if prefix filter removed everything
+        candidates = filtered if filtered else all_candidates
+
+        if len(candidates) > 3:
+            continue  # still ambiguous; drop
 
         remove_idx.add(idx)
         for c_id in candidates:
+            # If the candidate is a Class, route to its __init__ method if available
+            is_class = any(c_id in class_list for class_list in class_map.values())
+            target_id = init_map.get(c_id, c_id) if is_class else c_id
+
             new_edges.append(EdgeData(
                 type="CALLS",
                 source_id=edge.source_id,
-                target_id=c_id,
+                target_id=target_id,
                 properties={"fuzzy_resolved": True},
             ))
 
     edges[:] = [e for i, e in enumerate(edges) if i not in remove_idx] + new_edges
-    resolved = len(remove_idx)
-    logger.info("Global fuzzy resolution: %d dangling CALLS edge(s) resolved.", resolved)
+    logger.info("Global fuzzy resolution: %d dangling CALLS edge(s) resolved.", len(remove_idx))
+
 
 
 

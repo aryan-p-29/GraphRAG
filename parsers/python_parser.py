@@ -127,6 +127,9 @@ class PythonParser(BaseParser):
                     elif defn.type == "function_definition":
                         self._handle_function(defn, src, file_path, nodes, edges)
 
+        # Extract calls at the module level (e.g., app = FastAPI(), decorators on top-level)
+        self._extract_calls(root, src, file_path, file_path, edges)
+
     # ── Import handling ───────────────────────────────────────────────────────
     def _add_module(self, name: str, file_path: str, nodes: list, edges: list) -> None:
         mod_id = f"module::{name}"
@@ -271,25 +274,42 @@ class PythonParser(BaseParser):
 
     # ── Call extraction ───────────────────────────────────────────────────────
     def _extract_calls(self, body: Node, src: bytes, caller_id: str, file_path: str, edges: list) -> None:
+        """
+        Walk the entire function body and emit CALLS edges for every call found.
+
+        Fix 1 — Namespace preservation:
+          Attribute calls emit the FULL dotted target, e.g.
+            crud.create_user()  → target_id = "file.py::crud.create_user"
+            self._helper()      → target_id = "file.py::self._helper"
+          global_fuzzy_resolve uses the prefix ("crud", "self") to pinpoint
+          the correct candidate across files.
+
+        Fix 2 — Try-block traversal:
+          try_statement nodes are NOT in _SCOPE_TYPES so the stack does descend
+          into them via the generic child push. However, in tree-sitter Python
+          the except clauses live under specific named children that may be
+          skipped by plain .children iteration. We add explicit handling to
+          ensure the body, every except_clause body, and the finally_clause
+          body are all pushed.
+        """
         _SCOPE_TYPES = frozenset({
             "function_definition",
             "class_definition",
-            "decorated_definition",
         })
 
-        # We rely on pure LIFO stack traversal. No seen set. No memory leaks.
+        # Sub-node types inside try_statement whose children we must traverse
+        _TRY_INNER_TYPES = frozenset({
+            "try_statement",
+            "except_clause",
+            "except_group_clause",  # Python 3.11+ ExceptionGroup
+            "finally_clause",
+            "else_clause",
+        })
+
         stack: list[Node] = list(body.children)
 
         while stack:
             node = stack.pop()
-
-            # --- ADD THIS PROBE ---
-            if "inventory_prediction" in caller_id:
-                print(f"DEBUG WALK: Visiting -> {node.type}")
-                if node.type == "call":
-                    fn_node = node.child_by_field_name("function")
-                    print(f"   -> CALL FOUND! Function child type: {fn_node.type if fn_node else 'None'}")
-            # ----------------------
 
             # ── Rule 1: skip nested scopes ────────────────────────────────
             if node.type in _SCOPE_TYPES:
@@ -300,17 +320,30 @@ class PythonParser(BaseParser):
                 fn_node = node.child_by_field_name("function")
                 if fn_node is not None:
                     if fn_node.type == "identifier":
+                        # Simple call: get_engine(), SomeClass(), …
                         callee = _node_text(fn_node, src)
+
                     elif fn_node.type == "attribute":
+                        # FIX: preserve the full dotted name so the resolver
+                        # can use the object prefix for disambiguation.
+                        # e.g. crud.create_user, self._parse, db.session.add
+                        obj_node  = fn_node.child_by_field_name("object")
                         attr_node = fn_node.child_by_field_name("attribute")
-                        callee = (
-                            _node_text(attr_node, src)
-                            if attr_node is not None
-                            else _node_text(fn_node, src).split(".")[-1]
-                        )
+                        if obj_node is not None and attr_node is not None:
+                            callee = (
+                                _node_text(obj_node, src)
+                                + "."
+                                + _node_text(attr_node, src)
+                            )
+                        elif attr_node is not None:
+                            callee = _node_text(attr_node, src)
+                        else:
+                            callee = _node_text(fn_node, src).split(".")[-1]
+
                     else:
+                        # Fallback: subscript calls, chained calls, etc.
                         raw    = _node_text(fn_node, src)
-                        callee = raw.replace("self.", "").split(".")[0]
+                        callee = raw.split("(")[0]  # strip any inline args
 
                     callee_id = f"{file_path}::{callee}"
                     edges.append(EdgeData(
@@ -319,6 +352,14 @@ class PythonParser(BaseParser):
                         target_id=callee_id,
                     ))
 
-            # ── Rule 3: continue into children ────────────────────────────
-            for child in node.children:
-                stack.append(child)
+            # ── Rule 3: push children; explicitly handle try_statement ─────
+            if node.type in _TRY_INNER_TYPES:
+                # Push every child of try/except/finally blocks individually
+                # so none of their inner statements are silently skipped.
+                for child in node.children:
+                    if child.type not in _SCOPE_TYPES:
+                        stack.append(child)
+            else:
+                for child in node.children:
+                    stack.append(child)
+
